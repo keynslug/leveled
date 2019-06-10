@@ -733,10 +733,14 @@ handle_cast({clerk_complete, ManifestSnippet, FilesToDelete}, State) ->
                             pending_removals=FilesToDelete,
                             compaction_pending=false}};
 handle_cast({release_snapshot, Snapshot}, State) ->
-    Rs = lists:keydelete(Snapshot, 1, State#state.registered_snapshots),
     leveled_log:log("I0003", [Snapshot]),
-    leveled_log:log("I0004", [length(Rs)]),
-    {noreply, State#state{registered_snapshots=Rs}};
+    case lists:keydelete(Snapshot, 1, State#state.registered_snapshots) of
+        [] ->
+            {noreply, State#state{registered_snapshots=[]}};
+        Rs ->
+            leveled_log:log("I0004", [length(Rs)]),
+            {noreply, State#state{registered_snapshots=Rs}}
+    end;
 handle_cast({log_level, LogLevel}, State) ->
     INC = State#state.clerk,
     ok = leveled_iclerk:clerk_loglevel(INC, LogLevel),
@@ -1060,7 +1064,7 @@ close_allmanifest([H|ManifestT]) ->
 open_all_manifest([], RootPath, CDBOpts) ->
     leveled_log:log("I0011", []),
     leveled_imanifest:add_entry([],
-                                start_new_activejournal(1, RootPath, CDBOpts),
+                                start_new_activejournal(0, RootPath, CDBOpts),
                                 true);
 open_all_manifest(Man0, RootPath, CDBOpts) ->
     Man1 = leveled_imanifest:to_list(Man0),
@@ -1512,9 +1516,9 @@ empty_manifest_test() ->
     ?assertMatch(not_present, ink_fetch(Ink2, key_converter("Key1"), 1)),
     {ok, SQN, Size} = 
         ink_put(Ink2, key_converter("Key1"), "Value1", {[], infinity}),
-    ?assertMatch(2, SQN),
+    ?assertMatch(1, SQN), % This is the first key - so should have SQN of 1
     ?assertMatch(true, Size > 0),
-    {ok, V} = ink_fetch(Ink2, key_converter("Key1"), 2),
+    {ok, V} = ink_fetch(Ink2, key_converter("Key1"), 1),
     ?assertMatch("Value1", V),
     ink_close(Ink2),
     clean_testdir(RootPath).

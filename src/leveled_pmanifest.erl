@@ -208,6 +208,13 @@ save_manifest(Manifest, RootPath) ->
         % delete the previous one straight away.  Retain until enough have been
         % kept to make the probability of all being independently corrupted 
         % through separate events negligible
+    ok = remove_manifest(RootPath, GC_SQN),
+        % Sometimes we skip a SQN, so to GC all may need to clear up previous
+        % as well
+    ok = remove_manifest(RootPath, GC_SQN - 1).
+
+-spec remove_manifest(string(), integer()) -> ok.
+remove_manifest(RootPath, GC_SQN) ->
     LFP = filepath(RootPath, GC_SQN, current_manifest),
     ok = 
         case filelib:is_file(LFP) of
@@ -216,6 +223,7 @@ save_manifest(Manifest, RootPath) ->
             _ ->
                 ok
         end.
+
 
 -spec replace_manifest_entry(manifest(), integer(), integer(),
                                     list()|manifest_entry(),
@@ -557,7 +565,7 @@ load_level(LevelIdx, Level, LoadFun, SQNFun) ->
     HigherLevelLoadFun =
         fun(ME, {L_Out, L_MaxSQN, FileList, BloomL}) ->
             FN = ME#manifest_entry.filename,
-            {P, Bloom} = LoadFun(FN),
+            {P, Bloom} = LoadFun(FN, LevelIdx),
             SQN = SQNFun(P),
             {[ME#manifest_entry{owner=P}|L_Out], 
                 max(SQN, L_MaxSQN),
@@ -567,7 +575,7 @@ load_level(LevelIdx, Level, LoadFun, SQNFun) ->
     LowerLevelLoadFun =
         fun({EK, ME}, {L_Out, L_MaxSQN, FileList, BloomL}) ->
             FN = ME#manifest_entry.filename,
-            {P, Bloom} = LoadFun(FN),
+            {P, Bloom} = LoadFun(FN, LevelIdx),
             SQN = SQNFun(P),
             {[{EK, ME#manifest_entry{owner=P}}|L_Out], 
                 max(SQN, L_MaxSQN),

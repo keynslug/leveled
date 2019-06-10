@@ -84,7 +84,7 @@
 -define(DELETE_TIMEOUT, 10000).
 -define(TREE_TYPE, idxt).
 -define(TREE_SIZE, 4).
--define(TIMING_SAMPLECOUNTDOWN, 10000).
+-define(TIMING_SAMPLECOUNTDOWN, 20000).
 -define(TIMING_SAMPLESIZE, 100).
 -define(CACHE_SIZE, 32).
 -define(BLOCK_LENGTHS_LENGTH, 20).
@@ -113,7 +113,7 @@
 -export([sst_new/6,
             sst_new/8,
             sst_newlevelzero/7,
-            sst_open/3,
+            sst_open/4,
             sst_get/2,
             sst_get/3,
             sst_expandpointer/5,
@@ -180,7 +180,7 @@
 -record(state,      
                 {summary,
                     handle :: file:fd() | undefined,
-                    penciller :: pid() | undefined,
+                    penciller :: pid() | undefined | false,
                     root_path,
                     filename,
                     yield_blockquery = false :: boolean(),
@@ -192,7 +192,8 @@
                     starting_pid :: pid()|undefined,
                     fetch_cache = array:new([{size, ?CACHE_SIZE}]),
                     new_slots :: list()|undefined,
-                    deferred_startup_tuple :: tuple()|undefined}).
+                    deferred_startup_tuple :: tuple()|undefined,
+                    level :: non_neg_integer()|undefined}).
 
 -record(sst_timings, 
                 {sample_count = 0 :: integer(),
@@ -224,7 +225,7 @@
 %%% API
 %%%============================================================================
 
--spec sst_open(string(), string(), sst_options())
+-spec sst_open(string(), string(), sst_options(), non_neg_integer())
             -> {ok, pid(), 
                     {leveled_codec:ledger_key(), leveled_codec:ledger_key()}, 
                     binary()}.
@@ -236,10 +237,11 @@
 %% term order.
 %%
 %% The filename should include the file extension.
-sst_open(RootPath, Filename, OptsSST) ->
+sst_open(RootPath, Filename, OptsSST, Level) ->
     {ok, Pid} = gen_fsm:start_link(?MODULE, [], []),
     case gen_fsm:sync_send_event(Pid,
-                                    {sst_open, RootPath, Filename, OptsSST},
+                                    {sst_open,
+                                        RootPath, Filename, OptsSST, Level},
                                     infinity) of
         {ok, {SK, EK}, Bloom} ->
             {ok, Pid, {SK, EK}, Bloom}
@@ -456,8 +458,8 @@ sst_checkready(Pid) ->
 %% This simply prompts a GC on the PID now (as this may now be a long-lived
 %% file, so don't want all the startup state to be held on memory - want to
 %% proactively drop it
-sst_switchlevels(Pid, _NewLevel) ->
-    gen_fsm:send_event(Pid, switch_levels).
+sst_switchlevels(Pid, NewLevel) ->
+    gen_fsm:send_event(Pid, {switch_levels, NewLevel}).
 
 -spec sst_close(pid()) -> ok.
 %% @doc
@@ -481,7 +483,7 @@ sst_printtimings(Pid) ->
 init([]) ->
     {ok, starting, #state{}}.
 
-starting({sst_open, RootPath, Filename, OptsSST}, _From, State) ->
+starting({sst_open, RootPath, Filename, OptsSST, Level}, _From, State) ->
     leveled_log:save(OptsSST#sst_options.log_options),
     {UpdState, Bloom} = 
         read_file(Filename, State#state{root_path=RootPath}),
@@ -489,7 +491,7 @@ starting({sst_open, RootPath, Filename, OptsSST}, _From, State) ->
     {reply,
         {ok, {Summary#summary.first_key, Summary#summary.last_key}, Bloom},
         reader,
-        UpdState};
+        UpdState#state{level = Level}};
 starting({sst_new, 
             RootPath, Filename, Level, 
             {SlotList, FirstKey}, MaxSQN,
@@ -512,19 +514,22 @@ starting({sst_new,
     leveled_log:log_timer("SST08",
                             [ActualFilename, Level, Summary#summary.max_sqn],
                             SW),
+    erlang:send_after(?STARTUP_TIMEOUT, self(), tidyup_after_startup),
+        % always want to have an opportunity to GC - so force the timeout to
+        % occur whether or not there is an intervening message
     {reply,
         {ok, {Summary#summary.first_key, Summary#summary.last_key}, Bloom},
         reader,
         UpdState#state{blockindex_cache = BlockIndex,
-                        starting_pid = StartingPID},
-        ?STARTUP_TIMEOUT};
+                        starting_pid = StartingPID,
+                        level = Level}};
 starting({sst_newlevelzero, RootPath, Filename,
                     Penciller, MaxSQN,
                     OptsSST, IdxModDate}, _From, State) -> 
     DeferredStartupTuple = 
         {RootPath, Filename, Penciller, MaxSQN, OptsSST, IdxModDate},
     {reply, ok, starting,
-        State#state{deferred_startup_tuple = DeferredStartupTuple}};
+        State#state{deferred_startup_tuple = DeferredStartupTuple, level = 0}};
 starting(close, _From, State) ->
     % No file should have been created, so nothing to close.
     {stop, normal, ok, State}.
@@ -628,7 +633,9 @@ reader({get_kv, LedgerKey, Hash}, _From, State) ->
         fetch(LedgerKey, Hash, State, State#state.timings),
 
     {UpdTimings0, CountDown} = 
-        update_statetimings(UpdTimings, State#state.timings_countdown),
+        update_statetimings(UpdTimings,
+                            State#state.timings_countdown,
+                            State#state.level),
     
     {reply, Result, reader, UpdState#state{timings = UpdTimings0,
                                             timings_countdown = CountDown}};
@@ -687,7 +694,7 @@ reader(get_maxsequencenumber, _From, State) ->
     Summary = State#state.summary,
     {reply, Summary#summary.max_sqn, reader, State};
 reader(print_timings, _From, State) ->
-    log_timings(State#state.timings),
+    log_timings(State#state.timings, State#state.level),
     {reply, ok, reader, State};
 reader({set_for_delete, Penciller}, _From, State) ->
     leveled_log:log("SST06", [State#state.filename]),
@@ -709,16 +716,9 @@ reader(close, _From, State) ->
     ok = file:close(State#state.handle),
     {stop, normal, ok, State}.
 
-reader(switch_levels, State) ->
+reader({switch_levels, NewLevel}, State) ->
     erlang:garbage_collect(self()),
-    {next_state, reader, State};
-reader(timeout, State) ->
-    case is_process_alive(State#state.starting_pid) of
-        true ->
-            {next_state, reader, State};
-        false ->
-            {stop, normal, State}
-    end.
+    {next_state, reader, State#state{level = NewLevel}}.
 
 
 delete_pending({get_kv, LedgerKey, Hash}, _From, State) ->
@@ -762,9 +762,13 @@ delete_pending(close, _From, State) ->
     {stop, normal, ok, State}.
 
 delete_pending(timeout, State) ->
-    ok = leveled_penciller:pcl_confirmdelete(State#state.penciller,
-                                               State#state.filename,
-                                               self()),
+    case State#state.penciller of
+        false ->
+            ok = leveled_sst:sst_deleteconfirmed(self());
+        PCL ->
+            FN = State#state.filename,
+            ok = leveled_penciller:pcl_confirmdelete(PCL, FN, self())
+    end,
     % If the next thing is another timeout - may be long-running snapshot, so
     % back-off
     {next_state, delete_pending, State, leveled_rand:uniform(10) * ?DELETE_TIMEOUT};
@@ -781,8 +785,18 @@ handle_sync_event(_Msg, _From, StateName, State) ->
 handle_event(_Msg, StateName, State) ->
     {next_state, StateName, State}.
 
-handle_info(_Msg, StateName, State) ->
-    {next_state, StateName, State}.
+handle_info(tidyup_after_startup, delete_pending, State) ->
+    % No need to GC, this file is to be shutdown.  This message may have
+    % interrupted the delete timeout, so timeout straight away
+    {next_state, delete_pending, State, 0};
+handle_info(tidyup_after_startup, StateName, State) ->
+    case is_process_alive(State#state.starting_pid) of
+        true ->
+            erlang:garbage_collect(self()),
+            {next_state, StateName, State};
+        false ->
+            {stop, normal, State}
+    end.
 
 terminate(normal, delete_pending, _State) ->
     ok;
@@ -2478,7 +2492,7 @@ log_buildtimings(Timings, LI) ->
                                 element(2, LI)]).
 
 
--spec update_statetimings(sst_timings(), integer()) 
+-spec update_statetimings(sst_timings(), integer(), non_neg_integer()) 
                                             -> {sst_timings(), integer()}.
 %% @doc
 %%
@@ -2489,23 +2503,27 @@ log_buildtimings(Timings, LI) ->
 %%
 %% Outside of sample windows the timings object should be set to the atom
 %% no_timing.  no_timing is a valid state for the cdb_timings type.
-update_statetimings(no_timing, 0) ->
+update_statetimings(no_timing, 0, _Level) ->
     {#sst_timings{}, 0};
-update_statetimings(Timings, 0) ->
+update_statetimings(Timings, 0, Level) ->
     case Timings#sst_timings.sample_count of 
         SC when SC >= ?TIMING_SAMPLESIZE ->
-            log_timings(Timings),
-            {no_timing, leveled_rand:uniform(2 * ?TIMING_SAMPLECOUNTDOWN)};
+            log_timings(Timings, Level),
+                % If file at lower level wait longer before tsking another
+                % sample
+            {no_timing,
+                leveled_rand:uniform(2 * ?TIMING_SAMPLECOUNTDOWN)};
         _SC ->
             {Timings, 0}
     end;
-update_statetimings(no_timing, N) ->
+update_statetimings(no_timing, N, _Level) ->
     {no_timing, N - 1}.
 
-log_timings(no_timing) ->
+log_timings(no_timing, _Level) ->
     ok;
-log_timings(Timings) ->
-    leveled_log:log("SST12", [Timings#sst_timings.sample_count, 
+log_timings(Timings, Level) ->
+    leveled_log:log("SST12", [Level,
+                                Timings#sst_timings.sample_count, 
                                 Timings#sst_timings.index_query_time,
                                 Timings#sst_timings.lookup_cache_time,
                                 Timings#sst_timings.slot_index_time,
@@ -2572,6 +2590,8 @@ update_timings(SW, Timings, Stage, Continue) ->
 %%%============================================================================
 
 -ifdef(TEST).
+
+-define(TEST_AREA, "test/test_area/").
 
 testsst_new(RootPath, Filename, Level, KVList, MaxSQN, PressMethod) ->
     OptsSST = 
@@ -2925,6 +2945,7 @@ test_binary_slot(FullBin, Key, Hash, ExpectedValue) ->
 
     
 merge_test() ->
+    filelib:ensure_dir(?TEST_AREA),
     merge_tester(fun testsst_new/6, fun testsst_new/8).
 
 
@@ -2935,9 +2956,9 @@ merge_tester(NewFunS, NewFunM) ->
     KVL3 = lists:ukeymerge(1, KVL1, KVL2),
     SW0 = os:timestamp(),
     {ok, P1, {FK1, LK1}, _Bloom1} = 
-        NewFunS("test/test_area/", "level1_src", 1, KVL1, 6000, native),
+        NewFunS(?TEST_AREA, "level1_src", 1, KVL1, 6000, native),
     {ok, P2, {FK2, LK2}, _Bloom2} = 
-        NewFunS("test/test_area/", "level2_src", 2, KVL2, 3000, native),
+        NewFunS(?TEST_AREA, "level2_src", 2, KVL2, 3000, native),
     ExpFK1 = element(1, lists:nth(1, KVL1)),
     ExpLK1 = element(1, lists:last(KVL1)),
     ExpFK2 = element(1, lists:nth(1, KVL2)),
@@ -2949,7 +2970,7 @@ merge_tester(NewFunS, NewFunM) ->
     ML1 = [{next, #manifest_entry{owner = P1}, FK1}],
     ML2 = [{next, #manifest_entry{owner = P2}, FK2}],
     NewR = 
-        NewFunM("test/test_area/", "level2_merge", ML1, ML2, false, 2, N * 2, native),
+        NewFunM(?TEST_AREA, "level2_merge", ML1, ML2, false, 2, N * 2, native),
     {ok, P3, {{Rem1, Rem2}, FK3, LK3}, _Bloom3} = NewR,
     ?assertMatch([], Rem1),
     ?assertMatch([], Rem2),
@@ -2972,16 +2993,16 @@ merge_tester(NewFunS, NewFunM) ->
     ok = sst_close(P1),
     ok = sst_close(P2),
     ok = sst_close(P3),
-    ok = file:delete("test/test_area/level1_src.sst"),
-    ok = file:delete("test/test_area/level2_src.sst"),
-    ok = file:delete("test/test_area/level2_merge.sst").
+    ok = file:delete(?TEST_AREA ++ "/level1_src.sst"),
+    ok = file:delete(?TEST_AREA ++ "/level2_src.sst"),
+    ok = file:delete(?TEST_AREA ++ "/level2_merge.sst").
     
 
 simple_persisted_range_test() ->
     simple_persisted_range_tester(fun testsst_new/6).
 
 simple_persisted_range_tester(SSTNewFun) ->
-    {RP, Filename} = {"test/test_area/", "simple_test"},
+    {RP, Filename} = {?TEST_AREA, "simple_test"},
     KVList0 = generate_randomkeys(1, ?LOOK_SLOTSIZE * 16, 1, 20),
     KVList1 = lists:ukeysort(1, KVList0),
     [{FirstKey, _FV}|_Rest] = KVList1,
@@ -3023,7 +3044,7 @@ simple_persisted_rangesegfilter_test() ->
     simple_persisted_rangesegfilter_tester(fun testsst_new/6).
 
 simple_persisted_rangesegfilter_tester(SSTNewFun) ->
-    {RP, Filename} = {"test/test_area/", "range_segfilter_test"},
+    {RP, Filename} = {?TEST_AREA, "range_segfilter_test"},
     KVList0 = generate_randomkeys(1, ?LOOK_SLOTSIZE * 16, 1, 20),
     KVList1 = lists:ukeysort(1, KVList0),
     [{FirstKey, _FV}|_Rest] = KVList1,
@@ -3115,7 +3136,7 @@ additional_range_test() ->
                         lists:seq(?NOLOOK_SLOTSIZE + Gap + 1,
                                     2 * ?NOLOOK_SLOTSIZE + Gap)),
     {ok, P1, {{Rem1, Rem2}, SK, EK}, _Bloom1} = 
-        testsst_new("test/test_area/", "range1_src", IK1, IK2, false, 1, 9999, native),
+        testsst_new(?TEST_AREA, "range1_src", IK1, IK2, false, 1, 9999, native),
     ?assertMatch([], Rem1),
     ?assertMatch([], Rem2),
     ?assertMatch(SK, element(1, lists:nth(1, IK1))),
@@ -3170,7 +3191,7 @@ simple_persisted_slotsize_test() ->
 
 
 simple_persisted_slotsize_tester(SSTNewFun) ->
-    {RP, Filename} = {"test/test_area/", "simple_slotsize_test"},
+    {RP, Filename} = {?TEST_AREA, "simple_slotsize_test"},
     KVList0 = generate_randomkeys(1, ?LOOK_SLOTSIZE * 2, 1, 20),
     KVList1 = lists:sublist(lists:ukeysort(1, KVList0),
                             ?LOOK_SLOTSIZE),
@@ -3185,6 +3206,25 @@ simple_persisted_slotsize_tester(SSTNewFun) ->
     ok = sst_close(Pid),
     ok = file:delete(filename:join(RP, Filename ++ ".sst")).
 
+
+delete_pending_test_() ->
+    {timeout, 30, fun delete_pending_tester/0}.
+
+delete_pending_tester() ->
+    % Confirm no race condition between the GC call and the delete timeout
+    {RP, Filename} = {?TEST_AREA, "deletepending_test"},
+    KVList0 = generate_randomkeys(1, ?LOOK_SLOTSIZE * 32, 1, 20),
+    KVList1 = lists:ukeysort(1, KVList0),
+    [{FirstKey, _FV}|_Rest] = KVList1,
+    {LastKey, _LV} = lists:last(KVList1),
+    {ok, Pid, {FirstKey, LastKey}, _Bloom} = 
+        testsst_new(RP, Filename, 1, KVList1, length(KVList1), native),
+    timer:sleep(2000),
+    leveled_sst:sst_setfordelete(Pid, false),
+    timer:sleep(?DELETE_TIMEOUT + 1000),
+    ?assertMatch(false, is_process_alive(Pid)).
+
+
 simple_persisted_test_() ->
     {timeout, 60, fun simple_persisted_test_bothformats/0}.
 
@@ -3192,7 +3232,7 @@ simple_persisted_test_bothformats() ->
     simple_persisted_tester(fun testsst_new/6).
 
 simple_persisted_tester(SSTNewFun) ->
-    {RP, Filename} = {"test/test_area/", "simple_test"},
+    {RP, Filename} = {?TEST_AREA, "simple_test"},
     KVList0 = generate_randomkeys(1, ?LOOK_SLOTSIZE * 32, 1, 20),
     KVList1 = lists:ukeysort(1, KVList0),
     [{FirstKey, _FV}|_Rest] = KVList1,
@@ -3352,9 +3392,6 @@ key_dominates_test() ->
 nonsense_coverage_test() ->
     {ok, Pid} = gen_fsm:start_link(?MODULE, [], []),
     ok = gen_fsm:send_all_state_event(Pid, nonsense),
-    ?assertMatch({next_state, reader, #state{}}, handle_info(nonsense,
-                                                                reader,
-                                                                #state{})),
     ?assertMatch({ok, reader, #state{}}, code_change(nonsense,
                                                         reader,
                                                         #state{},
@@ -3431,5 +3468,41 @@ stopstart_test() ->
     % check we can close in the starting state.  This may happen due to the 
     % fetcher on new level zero files working in a loop
     ok = sst_close(Pid).
+
+stop_whenstarter_stopped_test_() ->
+    {timeout, 60, fun() -> stop_whenstarter_stopped_testto() end}.
+
+stop_whenstarter_stopped_testto() ->
+    RP = spawn(fun receive_fun/0),
+    spawn(fun() -> start_sst_fun(RP) end),
+    TestFun =
+        fun(X, Acc) ->
+            case Acc of
+                false -> false;
+                true -> 
+                    timer:sleep(X),
+                    is_process_alive(RP)
+            end
+        end,
+    ?assertMatch(false, lists:foldl(TestFun, true, [10000, 2000, 2000, 2000])).
+    
+
+receive_fun() ->
+    receive
+        {sst_pid, SST_P} ->
+            timer:sleep(?STARTUP_TIMEOUT + 1000),
+            ?assertMatch(false, is_process_alive(SST_P))
+    end.
+
+start_sst_fun(ProcessToInform) ->
+    N = 3000,
+    KVL1 = lists:ukeysort(1, generate_randomkeys(N + 1, N, 1, 20)),
+    OptsSST = 
+        #sst_options{press_method=native,
+                        log_options=leveled_log:get_opts()},
+    {ok, P1, {_FK1, _LK1}, _Bloom1} = 
+        sst_new(?TEST_AREA, "level1_src", 1, KVL1, 6000, OptsSST),
+    ProcessToInform ! {sst_pid, P1}.
+
 
 -endif.
