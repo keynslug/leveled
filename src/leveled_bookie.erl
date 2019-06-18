@@ -2534,7 +2534,7 @@ hashlist_query_testto() ->
     ObjL1 = generate_multiple_objects(1200, 1),
     % Put in all the objects with a TTL in the future
     Future = leveled_util:integer_now() + 300,
-    lists:foreach(fun({K, V, S}) -> ok = book_tempput(Bookie1,
+    lists:foreach(fun({K, V, S}) -> _ = book_tempput(Bookie1,
                                                         "Bucket", K, V, S,
                                                         ?STD_TAG,
                                                         Future) end,
@@ -2542,7 +2542,7 @@ hashlist_query_testto() ->
     ObjL2 = generate_multiple_objects(20, 1201),
     % Put in a few objects with a TTL in the past
     Past = leveled_util:integer_now() - 300,
-    lists:foreach(fun({K, V, S}) -> ok = book_tempput(Bookie1,
+    lists:foreach(fun({K, V, S}) -> _ = book_tempput(Bookie1,
                                                         "Bucket", K, V, S,
                                                         ?STD_TAG,
                                                         Past) end,
@@ -2615,7 +2615,7 @@ foldobjects_vs_hashtree_testto() ->
     ObjL1 = generate_multiple_objects(800, 1),
     % Put in all the objects with a TTL in the future
     Future = leveled_util:integer_now() + 300,
-    lists:foreach(fun({K, V, S}) -> ok = book_tempput(Bookie1,
+    lists:foreach(fun({K, V, S}) -> _ = book_tempput(Bookie1,
                                                         "Bucket", K, V, S,
                                                         ?STD_TAG,
                                                         Future) end,
@@ -2696,12 +2696,12 @@ folder_cache_test(CacheSize) ->
     ObjL2 = generate_multiple_objects(400, 1),
     % Put in all the objects with a TTL in the future
     Future = leveled_util:integer_now() + 300,
-    lists:foreach(fun({K, V, S}) -> ok = book_tempput(Bookie1,
+    lists:foreach(fun({K, V, S}) -> _ = book_tempput(Bookie1,
                                                         "BucketA", K, V, S,
                                                         ?STD_TAG,
                                                         Future) end,
                     ObjL1),
-    lists:foreach(fun({K, V, S}) -> ok = book_tempput(Bookie1,
+    lists:foreach(fun({K, V, S}) -> _ = book_tempput(Bookie1,
                                                         "BucketB", K, V, S,
                                                         ?STD_TAG,
                                                         Future) end,
