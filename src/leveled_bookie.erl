@@ -99,6 +99,10 @@
             fetch_value/2,
             journal_notfound/4]).
 
+-ifdef(TEST).
+-export([book_returnactors/1]).
+-endif.
+
 -include_lib("eunit/include/eunit.hrl").
 
 -define(CACHE_SIZE, 2500).
@@ -115,6 +119,7 @@
 -define(COMPRESSION_POINT, on_receipt).
 -define(LOG_LEVEL, info).
 -define(TIMING_SAMPLESIZE, 100).
+-define(DEFAULT_DBID, 65536).
 -define(TIMING_SAMPLECOUNTDOWN, 50000).
 -define(DUMMY, dummy). % Dummy key used for mput operations
 -define(MAX_KEYCHECK_FREQUENCY, 100).
@@ -140,6 +145,7 @@
                 {compression_point, ?COMPRESSION_POINT},
                 {log_level, ?LOG_LEVEL},
                 {forced_logs, []},
+                {database_id, ?DEFAULT_DBID},
                 {override_functions, []},
                 {snapshot_timeout_short, ?SNAPTIMEOUT_SHORT},
                 {snapshot_timeout_long, ?SNAPTIMEOUT_LONG}]).
@@ -339,6 +345,8 @@
             %       "P0032", "SST12", "CDB19", "SST13", "I0019"]}
             % Will log all timing points even when log_level is not set to
             % support info
+        {database_id, non_neg_integer()} |
+            % Integer database ID to be used in logs
         {override_functions, list(leveled_head:appdefinable_function_tuple())} |
             % Provide a list of override functions that will be used for
             % user-defined tags
@@ -1110,6 +1118,11 @@ book_addlogs(Pid, ForcedLogs) ->
 book_removelogs(Pid, ForcedLogs) ->
     gen_server:cast(Pid, {remove_logs, ForcedLogs}).
 
+%% @doc
+%% Return the Inker and Penciller - {ok, Inker, Penciller}.  Used only in tests
+book_returnactors(Pid) ->
+    gen_server:call(Pid, return_actors).
+
 
 %%%============================================================================
 %%% gen_server callbacks
@@ -1131,6 +1144,8 @@ init([Opts]) ->
             leveled_log:set_loglevel(LogLevel),
             ForcedLogs = proplists:get_value(forced_logs, Opts),
             leveled_log:add_forcedlogs(ForcedLogs),
+            DatabaseID = proplists:get_value(database_id, Opts),
+            leveled_log:set_databaseid(DatabaseID),
 
             {InkerOpts, PencillerOpts} = set_options(Opts),
 
@@ -1438,6 +1453,8 @@ handle_call(destroy, _From, State=#state{is_snapshot=Snp}) when Snp == false ->
     lists:foreach(fun(DirPath) -> delete_path(DirPath) end, InkPathList),
     lists:foreach(fun(DirPath) -> delete_path(DirPath) end, PCLPathList),
     {stop, normal, ok, State};
+handle_call(return_actors, _From, State) ->
+    {reply, {ok, State#state.inker, State#state.penciller}, State};
 handle_call(Msg, _From, State) ->
     {reply, {unsupported_message, element(1, Msg)}, State}.
 
@@ -2674,6 +2691,7 @@ folder_cache_test(CacheSize) ->
     {ok, Bookie1} = book_start([{root_path, RootPath},
                                     {max_journalsize, 1000000},
                                     {cache_size, CacheSize}]),
+    _ = book_returnactors(Bookie1),
     ObjL1 = generate_multiple_objects(400, 1),
     ObjL2 = generate_multiple_objects(400, 1),
     % Put in all the objects with a TTL in the future
