@@ -38,7 +38,8 @@
                         bloom :: binary() | none | undefined}).
 
 -record(cdb_options,
-                        {max_size :: integer() | undefined,
+                        {max_size :: pos_integer() | undefined,
+                        max_count :: pos_integer() | undefined,
                         file_path :: string() | undefined,
                         waste_path :: string() | undefined,
                         binary_mode = false :: boolean(),
@@ -51,7 +52,8 @@
                             :: leveled_sst:press_method(),
                         log_options = leveled_log:get_opts() 
                             :: leveled_log:log_options(),
-                        max_sstslots = 256 :: pos_integer()}).
+                        max_sstslots = 256 :: pos_integer(),
+                        pagecache_level = 1 :: pos_integer()}).
 
 -record(inker_options,
                         {cdb_max_size :: integer() | undefined,

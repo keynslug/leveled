@@ -361,13 +361,12 @@ handle_cast(scoring_complete, State) ->
             ok = CloseFun(FilterServer),
             ok = leveled_inker:ink_clerkcomplete(State#state.inker,
                                                     ManifestSlice,
-                                                    FilesToDelete),
-            {noreply, State#state{scoring_state = undefined}};
+                                                    FilesToDelete);
         false ->
             ok = CloseFun(FilterServer),
-            ok = leveled_inker:ink_clerkcomplete(State#state.inker, [], []),
-            {noreply, State#state{scoring_state = undefined}}
-    end;
+            ok = leveled_inker:ink_clerkcomplete(State#state.inker, [], [])
+    end,
+    {noreply, State#state{scoring_state = undefined}, hibernate};
 handle_cast({trim, PersistedSQN, ManifestAsList}, State) ->
     FilesToDelete = 
         leveled_imanifest:find_persistedentries(PersistedSQN, ManifestAsList),
@@ -519,15 +518,22 @@ size_comparison_score(KeySizeList, FilterFun, FilterServer, MaxSQN) ->
     FoldFunForSizeCompare =
         fun(KS, {ActSize, RplSize}) ->
             case KS of
-                {{SQN, _Type, PK}, Size} ->
-                    Check = FilterFun(FilterServer, PK, SQN),
-                    case {Check, SQN > MaxSQN} of
-                        {true, _} ->
+                {{SQN, Type, PK}, Size} ->
+                    MayScore =
+                        leveled_codec:is_compaction_candidate({SQN, Type, PK}),
+                    case MayScore of
+                        false ->
                             {ActSize + Size - ?CRC_SIZE, RplSize};
-                        {false, true} ->
-                            {ActSize + Size - ?CRC_SIZE, RplSize};
-                        _ ->
-                            {ActSize, RplSize + Size - ?CRC_SIZE}
+                        true ->
+                            Check = FilterFun(FilterServer, PK, SQN),
+                            case {Check, SQN > MaxSQN} of
+                                {true, _} ->
+                                    {ActSize + Size - ?CRC_SIZE, RplSize};
+                                {false, true} ->
+                                    {ActSize + Size - ?CRC_SIZE, RplSize};
+                                _ ->
+                                    {ActSize, RplSize + Size - ?CRC_SIZE}
+                            end
                     end;
                 _ ->
                     % There is a key which is not in expected format
@@ -548,7 +554,8 @@ size_comparison_score(KeySizeList, FilterFun, FilterServer, MaxSQN) ->
     end.
 
 
-fetch_inbatches([], _BatchSize, _CDB, CheckedList) ->
+fetch_inbatches([], _BatchSize, CDB, CheckedList) ->
+    ok = leveled_cdb:cdb_clerkcomplete(CDB),
     CheckedList;
 fetch_inbatches(PositionList, BatchSize, CDB, CheckedList) ->
     {Batch, Tail} = if
@@ -699,6 +706,11 @@ compact_files([Batch|T], CDBopts, ActiveJournal0,
                                                 ActiveJournal0,
                                                 ManSlice0,
                                                 PressMethod),
+    % The inker's clerk will no longer need these (potentially large) binaries,
+    % so force garbage collection at this point.  This will mean when we roll
+    % each CDB file there will be no remaining references to the binaries that
+    % have been transferred and the memory can immediately be cleared
+    garbage_collect(),
     compact_files(T, CDBopts, ActiveJournal1, FilterFun, FilterServer, MaxSQN,
                                 RStrategy, PressMethod, ManSlice1).
 
@@ -763,7 +775,7 @@ filter_output(KVCs, FilterFun, FilterServer, MaxSQN, ReloadStrategy) ->
                             % strategy
                             [KVC0|Acc];
                         {false, retain} ->
-                            % If we have a retain startegy, it can't be
+                            % If we have a retain strategy, it can't be
                             % discarded - but the value part is no longer
                             % required as this version has been replaced
                             {JK0, JV0} =
@@ -781,24 +793,24 @@ filter_output(KVCs, FilterFun, FilterServer, MaxSQN, ReloadStrategy) ->
 write_values([], _CDBopts, Journal0, ManSlice0, _PressMethod) ->
     {Journal0, ManSlice0};
 write_values(KVCList, CDBopts, Journal0, ManSlice0, PressMethod) ->
-    KVList = lists:map(fun({K, V, _C}) ->
+    KVList = 
+        lists:map(fun({K, V, _C}) ->
                             % Compress the value as part of compaction
-                            {K, leveled_codec:maybe_compress(V, PressMethod)}
-                            end,
-                        KVCList),
-    {ok, Journal1} = case Journal0 of
-                            null ->
-                                {TK, _TV} = lists:nth(1, KVList),
-                                {SQN, _LK} = leveled_codec:from_journalkey(TK),
-                                FP = CDBopts#cdb_options.file_path,
-                                FN = leveled_inker:filepath(FP,
-                                                            SQN,
-                                                            compact_journal),
-                                leveled_log:log("IC009", [FN]),
-                                leveled_cdb:cdb_open_writer(FN, CDBopts);
-                            _ ->
-                                {ok, Journal0}
-                        end,
+                        {K, leveled_codec:maybe_compress(V, PressMethod)}
+                    end,
+                    KVCList),
+    {ok, Journal1} = 
+        case Journal0 of
+            null ->
+                {TK, _TV} = lists:nth(1, KVList),
+                {SQN, _LK} = leveled_codec:from_journalkey(TK),
+                FP = CDBopts#cdb_options.file_path,
+                FN = leveled_inker:filepath(FP, SQN, compact_journal),
+                leveled_log:log("IC009", [FN]),
+                leveled_cdb:cdb_open_writer(FN, CDBopts);
+            _ ->
+                {ok, Journal0}
+        end,
     R = leveled_cdb:cdb_mput(Journal1, KVList),
     case R of
         ok ->
@@ -1169,13 +1181,13 @@ compact_singlefile_totwosmallfiles_testto() ->
 
 size_score_test() ->
     KeySizeList = 
-        [{{1, "INK", "Key1"}, 104},
-            {{2, "INK", "Key2"}, 124},
-            {{3, "INK", "Key3"}, 144},
-            {{4, "INK", "Key4"}, 154},
-            {{5, "INK", "Key5", "Subk1"}, 164},
-            {{6, "INK", "Key6"}, 174},
-            {{7, "INK", "Key7"}, 184}],
+        [{{1, ?INKT_STND, "Key1"}, 104},
+            {{2, ?INKT_STND, "Key2"}, 124},
+            {{3, ?INKT_STND, "Key3"}, 144},
+            {{4, ?INKT_STND, "Key4"}, 154},
+            {{5, ?INKT_STND, "Key5", "Subk1"}, 164},
+            {{6, ?INKT_STND, "Key6"}, 174},
+            {{7, ?INKT_STND, "Key7"}, 184}],
     MaxSQN = 6,
     CurrentList = ["Key1", "Key4", "Key5", "Key6"],
     FilterFun = fun(L, K, _SQN) -> lists:member(K, L) end,

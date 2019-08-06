@@ -1,6 +1,6 @@
 %% -------- Overview ---------
 %%
-%% The eleveleddb is based on the LSM-tree similar to leveldb, except that:
+%% Leveled is based on the LSM-tree similar to leveldb, except that:
 %% - Keys, Metadata and Values are not persisted together - the Keys and
 %% Metadata are kept in a tree-based ledger, whereas the values are stored
 %% only in a sequential Journal.
@@ -11,7 +11,7 @@
 %% and frequent use of iterators)
 %% - The Journal is an extended nursery log in leveldb terms.  It is keyed
 %% on the sequence number of the write
-%% - The ledger is a merge tree, where the key is the actaul object key, and
+%% - The ledger is a merge tree, where the key is the actual object key, and
 %% the value is the metadata of the object including the sequence number
 %%
 %%
@@ -127,11 +127,14 @@
 -define(OPEN_LASTMOD_RANGE, {0, infinity}).
 -define(SNAPTIMEOUT_SHORT, 900). % 15 minutes
 -define(SNAPTIMEOUT_LONG, 43200). % 12 hours
+-define(SST_PAGECACHELEVEL_NOLOOKUP, 1).
+-define(SST_PAGECACHELEVEL_LOOKUP, 4).
 -define(OPTION_DEFAULTS,
             [{root_path, undefined},
                 {snapshot_bookie, undefined},
                 {cache_size, ?CACHE_SIZE},
                 {max_journalsize, 1000000000},
+                {max_journalobjectcount, 200000},
                 {max_sstslots, 256},
                 {sync_strategy, none},
                 {head_only, false},
@@ -141,6 +144,7 @@
                 {maxrunlength_compactionpercentage, 70.0},
                 {reload_strategy, []},
                 {max_pencillercachesize, ?MAX_PCL_CACHE_SIZE},
+                {ledger_preloadpagecache_level, ?SST_PAGECACHELEVEL_LOOKUP},
                 {compression_method, ?COMPRESSION_METHOD},
                 {compression_point, ?COMPRESSION_POINT},
                 {log_level, ?LOG_LEVEL},
@@ -225,11 +229,15 @@
             % The size of the Bookie's memory, the cache of the recent 
             % additions to the ledger.  Defaults to ?CACHE_SIZE, plus some
             % randomised jitter (randomised jitter will still be added to 
-            % configured values
+            % configured values)
             % The minimum value is 100 - any lower value will be ignored
         {max_journalsize, pos_integer()} |
-            % The maximum size of a journal file in bytes.  The abolute 
+            % The maximum size of a journal file in bytes.  The absolute 
             % maximum must be 4GB due to 4 byte file pointers being used
+        {max_journalobjectcount, pos_integer()} |
+            % The maximum size of the journal by count of the objects.  The
+            % journal must remain within the limit set by both this figures and
+            % the max_journalsize
         {max_sstslots, pos_integer()} |
             % The maximum number of slots in a SST file.  All testing is done
             % at a size of 256 (except for Quickcheck tests}, altering this
@@ -241,7 +249,7 @@
             % partially in hardware (e.g through use of FBWC).
             % riak_sync is used for backwards compatability with OTP16 - and 
             % will manually call sync() after each write (rather than use the
-            % O_SYNC option on startup
+            % O_SYNC option on startup)
         {head_only, false|with_lookup|no_lookup} |
             % When set to true, there are three fundamental changes as to how
             % leveled will work:
@@ -313,6 +321,10 @@
             % The minimum size 400 - attempt to set this vlaue lower will be 
             % ignored.  As a rule the value should be at least 4 x the Bookie's
             % cache size
+        {ledger_preloadpagecache_level, pos_integer()} |
+            % To which level of the ledger should the ledger contents be
+            % pre-loaded into the pagecache (using fadvise on creation and
+            % startup)
         {compression_method, native|lz4} |
             % Compression method and point allow Leveled to be switched from
             % using bif based compression (zlib) to using nif based compression
@@ -448,7 +460,7 @@ book_tempput(Pid, Bucket, Key, Object, IndexSpecs, Tag, TTL)
 %% - A Primary Key and a Value
 %% - IndexSpecs - a set of secondary key changes associated with the
 %% transaction
-%% - A tag indictaing the type of object.  Behaviour for metadata extraction,
+%% - A tag indicating the type of object.  Behaviour for metadata extraction,
 %% and ledger compaction will vary by type.  There are three currently
 %% implemented types i (Index), o (Standard), o_rkv (Riak).  Keys added with
 %% Index tags are not fetchable (as they will not be hashed), but are
@@ -459,7 +471,7 @@ book_tempput(Pid, Bucket, Key, Object, IndexSpecs, Tag, TTL)
 %%
 %% The inker will pass the PK/Value/IndexSpecs to the current (append only)
 %% CDB journal file to persist the change.  The call should return either 'ok'
-%% or 'roll'. -'roll' indicates that the CDB file has insufficient capacity for
+%% or 'roll'. 'roll' indicates that the CDB file has insufficient capacity for
 %% this write, and a new journal file should be created (with appropriate
 %% manifest changes to be made).
 %%
@@ -1176,16 +1188,25 @@ init([Opts]) ->
                 false ->
                     ok
             end,
-            
-            {HeadOnly, HeadLookup} = 
+
+            PageCacheLevel = proplists:get_value(ledger_preloadpagecache_level, Opts),    
+
+            {HeadOnly, HeadLookup, SSTPageCacheLevel} = 
                 case proplists:get_value(head_only, Opts) of 
                     false ->
-                        {false, true};
+                        {false, true, PageCacheLevel};
                     with_lookup ->
-                        {true, true};
+                        {true, true, PageCacheLevel};
                     no_lookup ->
-                        {true, false}
+                        {true, false, ?SST_PAGECACHELEVEL_NOLOOKUP}
                 end,
+            % Override the default page cache level - we want to load into the
+            % page cache many levels if we intend to support lookups, and only
+            % levels 0 and 1 otherwise
+            SSTOpts = PencillerOpts#penciller_options.sst_options,
+            SSTOpts0 = SSTOpts#sst_options{pagecache_level = SSTPageCacheLevel},
+            PencillerOpts0 =
+                PencillerOpts#penciller_options{sst_options = SSTOpts0},
             
             State0 = #state{cache_size=CacheSize,
                                 is_snapshot=false,
@@ -1193,7 +1214,7 @@ init([Opts]) ->
                                 head_lookup = HeadLookup},
 
             {Inker, Penciller} = 
-                startup(InkerOpts, PencillerOpts, State0),
+                startup(InkerOpts, PencillerOpts0, State0),
 
             NewETS = ets:new(mem, [ordered_set]),
             leveled_log:log("B0001", [Inker, Penciller]),
@@ -1635,6 +1656,11 @@ set_options(Opts) ->
     MaxJournalSize = 
         min(?ABSOLUTEMAX_JOURNALSIZE, 
                 MaxJournalSize0 - erlang:phash2(self()) rem JournalSizeJitter),
+    MaxJournalCount0 =
+        proplists:get_value(max_journalobjectcount, Opts),
+    JournalCountJitter = MaxJournalCount0 div (100 div ?JOURNAL_SIZE_JITTER),
+    MaxJournalCount = 
+        MaxJournalCount0 - erlang:phash2(self()) rem JournalCountJitter,
 
     SyncStrat = proplists:get_value(sync_strategy, Opts),
     WRP = proplists:get_value(waste_retention_period, Opts),
@@ -1688,6 +1714,7 @@ set_options(Opts) ->
                         compress_on_receipt = CompressOnReceipt,
                         cdb_options = 
                             #cdb_options{max_size=MaxJournalSize,
+                                        max_count=MaxJournalCount,
                                         binary_mode=true,
                                         sync_strategy=SyncStrat,
                                         log_options=leveled_log:get_opts()}},
@@ -1733,7 +1760,7 @@ return_snapfun(State, SnapType, Query, LongRunning, SnapPreFold) ->
 -spec snaptype_by_presence(boolean()) -> store|ledger.
 %% @doc
 %% Folds that traverse over object heads, may also either require to return 
-%% the object,or at least confirm th eobject is present in the Ledger.  This
+%% the object, or at least confirm the object is present in the Ledger.  This
 %% is achieved by enabling presence - and this will change the type of 
 %% snapshot to one that covers the whole store (i.e. both ledger and journal),
 %% rather than just the ledger.
@@ -1744,7 +1771,7 @@ snaptype_by_presence(false) ->
 
 -spec get_runner(book_state(), tuple()) -> {async, fun()}.
 %% @doc
-%% Getan {async, Runner} for a given fold type.  Fold types have different 
+%% Get an {async, Runner} for a given fold type.  Fold types have different 
 %% tuple inputs
 get_runner(State, {index_query, Constraint, FoldAccT, Range, TermHandling}) ->
     {IdxFld, StartT, EndT} = Range,
@@ -1913,7 +1940,7 @@ get_deprecatedrunner(State,
                                         {tuple(), tuple(), tuple()|no_lookup}.
 %% @doc
 %% Convert a range of binary keys into a ledger key range, returning 
-%% {StartLK, EndLK, Query} where Query is  to indicate whether the query 
+%% {StartLK, EndLK, Query} where Query is to indicate whether the query 
 %% range is worth using to minimise the cost of the snapshot 
 return_ledger_keyrange(Tag, Bucket, KeyRange) ->
     {StartKey, EndKey, Snap} =
@@ -1957,7 +1984,7 @@ maybe_longrunning(SW, Aspect) ->
 -spec readycache_forsnapshot(ledger_cache(), tuple()|no_lookup|undefined) 
                                                         -> ledger_cache().
 %% @doc
-%% Strip the ledger cach back to only the relevant informaiton needed in 
+%% Strip the ledger cach back to only the relevant information needed in 
 %% the query, and to make the cache a snapshot (and so not subject to changes
 %% such as additions to the ets table)
 readycache_forsnapshot(LedgerCache, {StartKey, EndKey}) ->
@@ -2170,7 +2197,7 @@ addto_ledgercache({H, SQN, KeyChanges}, Cache) ->
                             loader) 
                                     -> ledger_cache().
 %% @doc
-%% Add a set of changes associated witha single sequence number (journal 
+%% Add a set of changes associated with a single sequence number (journal 
 %% update) to the ledger cache.  This is used explicitly when loading the
 %% ledger from the Journal (i.e. at startup) - and in this case the ETS insert
 %% can be bypassed, as all changes will be flushed to the Penciller before the

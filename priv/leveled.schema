@@ -63,9 +63,32 @@
 ]}.
 
 %% @doc The approximate size (in bytes) when a Journal file should be rolled.
-%% Normally keep this as around the size of o(100K) objects.  Default is 500MB
+%% Normally keep this as around the size of o(100K) objects.  Default is 1GB.
+%% Note that on startup an actual maximum size will be chosen which varies by
+%% a random factor from this point - to avoid coordination of roll events
+%% across vnodes.
 {mapping, "leveled.journal_size", "leveled.journal_size", [
   {default, 1000000000},
+  {datatype, integer}
+]}.
+
+%% @doc The approximate count of objects when a Journal file should be rolled.
+%% This time measured in object count, a file will be rolled if either the
+%% object count or the journal size limit is reached.  Default 200K.
+%% Note that on startup an actual maximum size will be chosen which varies by
+%% a random factor from this point - to avoid coordination of roll events
+%% across vnodes.
+{mapping, "leveled.journal_objectcount", "leveled.journal_objectcount", [
+  {default, 200000},
+  {datatype, integer}
+]}.
+
+%% @doc The level of the ledger to be pre-loaded into the page cache
+%% Depending on how much memory is available for the page cache, and how much
+%% disk I/O activity can be tolerated at startup - then the level at which the
+%% ledger is forced into the page cache can be controlled by configuration.
+{mapping, "leveled.ledger_pagecachelevel", "leveled.ledger_pagecachelevel", [
+  {default, 4},
   {datatype, integer}
 ]}.
 

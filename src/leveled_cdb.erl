@@ -58,7 +58,8 @@
                 {gen_fsm, sync_send_event, 2},
                 {gen_fsm, send_event, 2},
                 {gen_fsm, sync_send_all_state_event, 3},
-                {gen_fsm, send_all_state_event, 2}]}).
+                {gen_fsm, send_all_state_event, 2},
+                {gen_fsm, reply, 2}]}).
 -endif.
 
 -ifdef(slow_test).
@@ -113,7 +114,8 @@
             cdb_destroy/1,
             cdb_deletepending/1,
             cdb_deletepending/3,
-            cdb_isrolling/1]).
+            cdb_isrolling/1,
+            cdb_clerkcomplete/1]).
 
 -export([finished_rolling/1,
             hashtable_calc/2]).
@@ -136,10 +138,12 @@
 -record(state, {hashtree,
                 last_position :: integer() | undefined,
                 last_key = empty,
+                current_count = 0 :: non_neg_integer(),
                 hash_index = {} :: tuple(),
                 filename :: string() | undefined,
                 handle :: file:fd() | undefined,
-                max_size :: integer() | undefined,
+                max_size :: pos_integer() | undefined,
+                max_count :: pos_integer() | undefined,
                 binary_mode = false :: boolean(),
                 delete_point = 0 :: integer(),
                 inker :: pid() | undefined,
@@ -409,21 +413,38 @@ cdb_keycheck(Pid, Key) ->
 cdb_isrolling(Pid) ->
     gen_fsm:sync_send_all_state_event(Pid, cdb_isrolling, infinity).
 
+-spec cdb_clerkcomplete(pid()) -> ok.
+%% @doc
+%% When an Inker's clerk has finished with a CDB process, then it will call
+%% complete.  Currently this will prompt hibernation, as the CDB process may
+%% not be needed for a period.  
+cdb_clerkcomplete(Pid) ->
+    gen_fsm:send_all_state_event(Pid, clerk_complete).
+
 
 %%%============================================================================
 %%% gen_server callbacks
 %%%============================================================================
 
 init([Opts]) ->
-    MaxSize = case Opts#cdb_options.max_size of
-                    undefined ->
-                        ?MAX_FILE_SIZE;
-                    M ->
-                        M
-                end,
+    MaxSize = 
+        case Opts#cdb_options.max_size of
+            undefined ->
+                ?MAX_FILE_SIZE;
+            MS ->
+                MS
+        end,
+    MaxCount =
+        case Opts#cdb_options.max_count of
+            undefined ->
+                ?MAX_FILE_SIZE div 1000;
+            MC ->
+                MC
+        end,
     {ok,
         starting,
         #state{max_size=MaxSize,
+                max_count=MaxCount,
                 binary_mode=Opts#cdb_options.binary_mode,
                 waste_path=Opts#cdb_options.waste_path,
                 sync_strategy=Opts#cdb_options.sync_strategy,
@@ -436,28 +457,32 @@ starting({open_writer, Filename}, _From, State) ->
     {WriteOps, UpdStrategy} = set_writeops(State#state.sync_strategy),
     leveled_log:log("CDB13", [WriteOps]),
     {ok, Handle} = file:open(Filename, WriteOps),
-    {reply, ok, writer, State#state{handle=Handle,
-                                        sync_strategy = UpdStrategy,
-                                        last_position=LastPosition,
-                                        last_key=LastKey,
-                                        filename=Filename,
-                                        hashtree=HashTree}};
+    State0 = State#state{handle=Handle,
+                            current_count = size_hashtree(HashTree),
+                            sync_strategy = UpdStrategy,
+                            last_position=LastPosition,
+                            last_key=LastKey,
+                            filename=Filename,
+                            hashtree=HashTree},
+    {reply, ok, writer, State0, hibernate};
 starting({open_reader, Filename}, _From, State) ->
     leveled_log:save(State#state.log_options),
     leveled_log:log("CDB02", [Filename]),
     {Handle, Index, LastKey} = open_for_readonly(Filename, false),
-    {reply, ok, reader, State#state{handle=Handle,
-                                        last_key=LastKey,
-                                        filename=Filename,
-                                        hash_index=Index}};
+    State0 = State#state{handle=Handle,
+                            last_key=LastKey,
+                            filename=Filename,
+                            hash_index=Index},
+    {reply, ok, reader, State0, hibernate};
 starting({open_reader, Filename, LastKey}, _From, State) ->
     leveled_log:save(State#state.log_options),
     leveled_log:log("CDB02", [Filename]),
     {Handle, Index, LastKey} = open_for_readonly(Filename, LastKey),
-    {reply, ok, reader, State#state{handle=Handle,
-                                        last_key=LastKey,
-                                        filename=Filename,
-                                        hash_index=Index}}.
+    State0 = State#state{handle=Handle,
+                            last_key=LastKey,
+                            filename=Filename,
+                            hash_index=Index},
+    {reply, ok, reader, State0, hibernate}.
 
 writer({get_kv, Key}, _From, State) ->
     {reply,
@@ -477,47 +502,63 @@ writer({key_check, Key}, _From, State) ->
         writer,
         State};
 writer({put_kv, Key, Value}, _From, State) ->
-    Result = put(State#state.handle,
-                    Key,
-                    Value,
-                    {State#state.last_position, State#state.hashtree},
-                    State#state.binary_mode,
-                    State#state.max_size,
-                    State#state.last_key == empty),
-    case Result of
-        roll ->
-            %% Key and value could not be written
+    NewCount = State#state.current_count + 1,
+    case NewCount >= State#state.max_count of
+        true ->
             {reply, roll, writer, State};
-        {UpdHandle, NewPosition, HashTree} ->
-            ok =
-                case State#state.sync_strategy of
-                    riak_sync ->
-                        file:datasync(UpdHandle);
-                    _ ->
-                        ok
-                end,
-            {reply, ok, writer, State#state{handle=UpdHandle,
-                                                last_position=NewPosition,
-                                                last_key=Key,
-                                                hashtree=HashTree}}
+        false ->
+            Result = put(State#state.handle,
+                            Key,
+                            Value,
+                            {State#state.last_position, State#state.hashtree},
+                            State#state.binary_mode,
+                            State#state.max_size,
+                            State#state.last_key == empty),
+            case Result of
+                roll ->
+                    %% Key and value could not be written
+                    {reply, roll, writer, State};
+                {UpdHandle, NewPosition, HashTree} ->
+                    ok =
+                        case State#state.sync_strategy of
+                            riak_sync ->
+                                file:datasync(UpdHandle);
+                            _ ->
+                                ok
+                        end,
+                    {reply, ok, writer, State#state{handle=UpdHandle,
+                                                    current_count=NewCount,
+                                                    last_position=NewPosition,
+                                                    last_key=Key,
+                                                    hashtree=HashTree}}
+            end
     end;
 writer({mput_kv, []}, _From, State) ->
     {reply, ok, writer, State};
 writer({mput_kv, KVList}, _From, State) ->
-    Result = mput(State#state.handle,
-                    KVList,
-                    {State#state.last_position, State#state.hashtree},
-                    State#state.binary_mode,
-                    State#state.max_size),
-    case Result of
-        roll ->
-            %% Keys and values could not be written
+    NewCount = State#state.current_count + length(KVList),
+    TooMany = NewCount >= State#state.max_count,
+    NotEmpty = State#state.current_count > 0,
+    case (TooMany and NotEmpty) of
+        true ->
             {reply, roll, writer, State};
-        {UpdHandle, NewPosition, HashTree, LastKey} ->
-            {reply, ok, writer, State#state{handle=UpdHandle,
-                                                last_position=NewPosition,
-                                                last_key=LastKey,
-                                                hashtree=HashTree}}
+        false ->
+            Result = mput(State#state.handle,
+                            KVList,
+                            {State#state.last_position, State#state.hashtree},
+                            State#state.binary_mode,
+                            State#state.max_size),
+            case Result of
+                roll ->
+                    %% Keys and values could not be written
+                    {reply, roll, writer, State};
+                {UpdHandle, NewPosition, HashTree, LastKey} ->
+                    {reply, ok, writer, State#state{handle=UpdHandle,
+                                                    current_count=NewCount,
+                                                    last_position=NewPosition,
+                                                    last_key=LastKey,
+                                                    hashtree=HashTree}}
+            end
     end;
 writer(cdb_complete, _From, State) ->
     NewName = determine_new_filename(State#state.filename),
@@ -566,18 +607,16 @@ rolling({return_hashtable, IndexList, HashTreeBin}, _From, State) ->
     ets:delete(State#state.hashtree),
     {NewHandle, Index, LastKey} = open_for_readonly(NewName,
                                                     State#state.last_key),
+    State0 = State#state{handle=NewHandle,
+                            last_key=LastKey,
+                            filename=NewName,
+                            hash_index=Index},
     case State#state.deferred_delete of
         true ->
-            {reply, ok, delete_pending, State#state{handle=NewHandle,
-                                                    last_key=LastKey,
-                                                    filename=NewName,
-                                                    hash_index=Index}};
+            {reply, ok, delete_pending, State0};
         false ->
             leveled_log:log_timer("CDB18", [], SW),
-            {reply, ok, reader, State#state{handle=NewHandle,
-                                            last_key=LastKey,
-                                            filename=NewName,
-                                            hash_index=Index}}
+            {reply, ok, reader, State0, hibernate}
     end;
 rolling(check_hashtable, _From, State) ->
     {reply, false, rolling, State}.
@@ -618,33 +657,40 @@ reader({get_positions, SampleSize, Index, Acc}, _From, State) ->
         _ ->
             {reply, lists:sublist(UpdAcc, SampleSize), reader, State}
     end;
-reader({direct_fetch, PositionList, Info}, _From, State) ->
+reader({direct_fetch, PositionList, Info}, From, State) ->
     H = State#state.handle,
-    FilterFalseKey = fun(Tpl) -> case element(1, Tpl) of
-                                        false ->
-                                            false;
-                                        _Key ->
-                                            {true, Tpl}
-                                    end end,
-    Reply =
-        case Info of
-            key_only ->
-                FM = lists:filtermap(
-                        fun(P) ->
-                                FilterFalseKey(extract_key(H, P)) end,
-                            PositionList),
-                lists:map(fun(T) -> element(1, T) end, FM);
-            key_size ->
-                lists:filtermap(
-                    fun(P) ->
-                            FilterFalseKey(extract_key_size(H, P)) end,
-                        PositionList);
-            key_value_check ->
-                BM = State#state.binary_mode,
-                lists:map(fun(P) -> extract_key_value_check(H, P, BM) end,
-                            PositionList)
+    FilterFalseKey =
+        fun(Tpl) ->
+            case element(1, Tpl) of
+                false ->
+                    false;
+                _Key ->
+                    {true, Tpl}
+            end
         end,
-    {reply, Reply, reader, State};
+    
+    case Info of
+        key_only ->
+            FM = lists:filtermap(
+                    fun(P) ->
+                            FilterFalseKey(extract_key(H, P)) end,
+                        PositionList),
+            MapFun = fun(T) -> element(1, T) end,
+            {reply, lists:map(MapFun, FM), reader, State};
+        key_size ->
+            FilterFun = fun(P) -> FilterFalseKey(extract_key_size(H, P)) end,
+            {reply, lists:filtermap(FilterFun, PositionList), reader, State};
+        key_value_check ->
+            BM = State#state.binary_mode,
+            MapFun = fun(P) -> extract_key_value_check(H, P, BM) end,
+            % direct_fetch will occur in batches, so it doesn't make sense to
+            % hibernate the process that is likely to be used again.  However,
+            % a significant amount of unused binary references may have
+            % accumulated, so push a GC at this point
+            gen_fsm:reply(From, lists:map(MapFun, PositionList)),
+            garbage_collect(),
+            {next_state, reader, State}
+    end;
 reader(cdb_complete, _From, State) ->
     leveled_log:log("CDB05", [State#state.filename, reader, cdb_ccomplete]),
     ok = file:close(State#state.handle),
@@ -720,24 +766,21 @@ delete_pending(destroy, State) ->
 
 
 handle_sync_event({cdb_scan, FilterFun, Acc, StartPos},
-                    _From,
+                    From,
                     StateName,
                     State) ->
     {ok, EndPos0} = file:position(State#state.handle, eof),
-    {ok, StartPos0} = case StartPos of
-                            undefined ->
-                                file:position(State#state.handle,
-                                                ?BASE_POSITION);
-                            StartPos ->
-                                {ok, StartPos}
-                        end,
+    {ok, StartPos0} = 
+        case StartPos of
+            undefined ->
+                file:position(State#state.handle, ?BASE_POSITION);
+            StartPos ->
+                {ok, StartPos}
+        end,
     file:position(State#state.handle, StartPos0),
-    file:advise(State#state.handle, 
-                    StartPos0, 
-                    EndPos0 - StartPos0, 
-                    sequential),
-    MaybeEnd = (check_last_key(State#state.last_key) == empty) or
-                    (StartPos0 >= (EndPos0 - ?DWORD_SIZE)),
+    MaybeEnd =
+        (check_last_key(State#state.last_key) == empty) or
+        (StartPos0 >= (EndPos0 - ?DWORD_SIZE)),
     {LastPosition, Acc2} = 
         case MaybeEnd of
             true ->
@@ -749,12 +792,17 @@ handle_sync_event({cdb_scan, FilterFun, Acc, StartPos},
                                 Acc,
                                 State#state.last_key)
         end,
-    {ok, LastReadPos} = file:position(State#state.handle, cur),
-    file:advise(State#state.handle, 
-                    StartPos0, 
-                    LastReadPos - StartPos0, 
-                    dont_need),
-    {reply, {LastPosition, Acc2}, StateName, State};
+    % The scan may have created a lot of binary references, clear up the 
+    % reference counters for this process here manually.  The cdb process
+    % may be inactive for a period after the scan, and so GC may not kick in
+    % otherwise
+    %
+    % garbage_collect/0 is used in preference to hibernate, as we're generally
+    % scanning in batches at startup - so the process will be needed straight
+    % away.
+    gen_fsm:reply(From, {LastPosition, Acc2}),
+    garbage_collect(),
+    {next_state, StateName, State};
 handle_sync_event(cdb_lastkey, _From, StateName, State) ->
     {reply, State#state.last_key, StateName, State};
 handle_sync_event(cdb_firstkey, _From, StateName, State) ->
@@ -790,8 +838,8 @@ handle_sync_event(cdb_close, _From, StateName, State) ->
     file:close(State#state.handle),
     {stop, normal, ok, State}.
 
-handle_event(_Msg, StateName, State) ->
-    {next_state, StateName, State}.
+handle_event(clerk_complete, StateName, State) ->
+    {next_state, StateName, State, hibernate}.
 
 handle_info(_Msg, StateName, State) ->
     {next_state, StateName, State}.
@@ -1755,6 +1803,9 @@ add_position_tohashtree(HashTree, Index, Hash, Position) ->
 new_hashtree() ->
     ets:new(hashtree, [ordered_set]).
 
+size_hashtree(HashTree) ->
+    ets:info(HashTree, size).
+
 to_list(HashTree, Index) ->
     to_list(HashTree, Index, {0, -1}, []).
 
@@ -2668,8 +2719,6 @@ getpositions_sample_test() ->
 
 
 nonsense_coverage_test() ->
-    {ok, Pid} = gen_fsm:start_link(?MODULE, [#cdb_options{}], []),
-    ok = gen_fsm:send_all_state_event(Pid, nonsense),
     ?assertMatch({next_state, reader, #state{}}, handle_info(nonsense,
                                                                 reader,
                                                                 #state{})),
