@@ -206,7 +206,7 @@ updateload_next(#{model := Model} = S, _V, [_Pid, Bucket, Key, _Value, Obj, Spec
                S).
 
 updateload_post(S, [_, _, _, _, _, _, _, _], Results) ->
-    lists:all(fun(Res) -> ?CMD_VALID(S, put, Res == ok, Res == {unsupported_message, put}) end, Results).
+    lists:all(fun(Res) -> ?CMD_VALID(S, put, lists:member(Res, [ok, pause]), Res == {unsupported_message, put}) end, Results).
 
 updateload_features(#{previous_keys := PK} = S, [_Pid, Bucket, Key, _Value, _Obj, _, Tag, _], _Res) ->
     ?CMD_VALID(S, put,
@@ -262,7 +262,7 @@ put_next(#{model := Model, previous_keys := PK} = S, _Value, [_Pid, Bucket, Key,
                S).
 
 put_post(S, [_, _, _, _, _, _], Res) ->
-    ?CMD_VALID(S, put, eq(Res, ok), eq(Res, {unsupported_message, put})).
+    ?CMD_VALID(S, put, lists:member(Res, [ok, pause]), eq(Res, {unsupported_message, put})).
 
 put_features(#{previous_keys := PK} = S, [_Pid, Bucket, Key, _Value, _, Tag], _Res) ->
     ?CMD_VALID(S, put,
@@ -363,7 +363,7 @@ mput_next(S, _, [_Pid, ObjSpecs]) ->
                S).
 
 mput_post(S, [_, _], Res) ->
-    ?CMD_VALID(S, mput, eq(Res, ok), eq(Res, {unsupported_message, mput})).
+    ?CMD_VALID(S, mput, lists:member(Res, [ok, pause]), eq(Res, {unsupported_message, mput})).
 
 mput_features(S, [_Pid, ObjSpecs], _Res) ->
     ?CMD_VALID(S, mput,
@@ -456,7 +456,7 @@ delete_next(#{model := Model, deleted_keys := DK} = S, _Value, [_Pid, Bucket, Ke
 
 delete_post(S, [_Pid, _Bucket, _Key, _, _], Res) ->
     ?CMD_VALID(S, delete,
-               eq(Res, ok),
+               lists:member(Res, [ok, pause]),
                case Res of
                    {unsupported_message, _} -> true;
                    _ -> Res
