@@ -39,6 +39,7 @@
 -behaviour(gen_server).
 
 -include("include/leveled.hrl").
+-include("include/leveled_codec.hrl").
 
 -export([init/1,
         handle_call/3,
@@ -2288,11 +2289,32 @@ recalcfor_ledgercache(_InkTag,
 %% update) and key to the ledger cache.  If the changes are not to be looked
 %% up directly, then they will not be indexed to accelerate lookup
 addto_ledgercache({H, SQN, KeyChanges}, Cache) ->
-    ets:insert(Cache#ledger_cache.mem, KeyChanges),
+    ok = merge_keychanges(KeyChanges, Cache#ledger_cache.mem),
     UpdIndex = leveled_pmem:prepare_for_index(Cache#ledger_cache.index, H),
     Cache#ledger_cache{index = UpdIndex,
                         min_sqn=min(SQN, Cache#ledger_cache.min_sqn),
                         max_sqn=max(SQN, Cache#ledger_cache.max_sqn)}.
+
+-spec merge_keychanges(list(leveled_codec:ledger_kv()), ets:tab()) ->
+    ok.
+
+merge_keychanges([KV = {K, V} | Rest], Mem) when
+    ?ledger_key_is_idx(K),
+    ?ledger_val_is_tomb(V) ->
+    case ets:lookup(Mem, K) of
+        [{_, VWas}] when ?ledger_val_is_active(VWas) ->
+            % Annihilate incoming tombstone with existing index value if given
+            % the chance, so that this tombstone would not be persisted at all.
+            ets:delete(Mem, K);
+        [] ->
+            ets:insert(Mem, KV)
+    end,
+    merge_keychanges(Rest, Mem);
+merge_keychanges([KV | Rest], Mem) ->
+    ets:insert(Mem, KV),
+    merge_keychanges(Rest, Mem);
+merge_keychanges([], _Mem) ->
+    ok.
 
 -spec addto_ledgercache({integer()|no_lookup, 
                                 integer(), 
@@ -2688,6 +2710,30 @@ ttl_test() ->
                     ObjL2),
 
     ok = book_close(Bookie2),
+    reset_filestructure().
+
+annihilate_tombs_test() ->
+    RootPath = reset_filestructure(),
+    {ok, Bookie1} = book_start([{root_path, RootPath}, {cache_size, 500}]),
+
+    ok = book_put(Bookie1, 
+                    "B", "K", {value, <<"V1">>}, [{add, <<"idx">>, 42}],
+                    ?STD_TAG),
+
+    ok = book_put(Bookie1, 
+                    "B", "K", {value, <<"V2">>}, [{remove, <<"idx">>, 42}, {add, <<"idx">>, 43}],
+                    ?STD_TAG),
+
+    ok = book_put(Bookie1, 
+                    "B", "K", {value, <<"V3">>}, [{remove, <<"idx">>, 43}, {add, <<"idx">>, 44}],
+                    ?STD_TAG),
+
+    State = sys:get_state(Bookie1),
+    LedgerCache = State#state.ledger_cache,
+    % Here we ensure that table will contain only the KV pair and its last updated index.
+    ?assertEqual(2, ets:info(LedgerCache#ledger_cache.mem, size)),
+
+    ok = book_close(Bookie1),
     reset_filestructure().
 
 hashlist_query_test_() ->
