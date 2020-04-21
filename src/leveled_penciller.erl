@@ -2388,6 +2388,8 @@ handle_down_test() ->
                 {ok, Snap, null}
         end,
 
+    PclSnapMon = erlang:monitor(process, PclSnap),
+
     FakeBookie ! stop,
 
     receive
@@ -2395,6 +2397,13 @@ handle_down_test() ->
             %% Now we know that pclr should have received this too!
             %% (better than timer:sleep/1)
             ok
+    end,
+
+    receive
+        {'DOWN', PclSnapMon, process, PclSnap, normal} ->
+            ok
+    after 1000 ->
+        ok
     end,
 
     ?assertEqual(undefined, erlang:process_info(PclSnap)),

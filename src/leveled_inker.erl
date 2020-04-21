@@ -1539,6 +1539,7 @@ handle_down_test() ->
                               source_inker=Ink1},
 
     {ok, Snap1} = ink_snapstart(SnapOpts),
+    Snap1Mon = erlang:monitor(process, Snap1),
 
     FakeBookie ! stop,
 
@@ -1547,6 +1548,13 @@ handle_down_test() ->
             %% Now we know that inker should have received this too!
             %% (better than timer:sleep/1)
             ok
+    end,
+
+    receive
+        {'DOWN', Snap1Mon, process, Snap1, normal} ->
+            ok
+    after 1000 ->
+        ok
     end,
 
     ?assertEqual(undefined, erlang:process_info(Snap1)),
